@@ -3,6 +3,20 @@
  * Shared code between Cloudflare Worker and Vercel deployments
  */
 
+import {createVerification} from './verification.js';
+
+// Content fields only: service updates such as pin notifications must not start challenges.
+const MESSAGE_CONTENT_FIELDS = [
+    'text', 'caption', 'photo', 'video', 'document', 'voice', 'audio', 'sticker',
+    'animation', 'video_note', 'contact', 'location', 'venue', 'poll', 'dice',
+    'live_photo', 'paid_media', 'game', 'story', 'checklist', 'rich_message'
+];
+
+function isUserMessage(message) {
+    return message.chat?.type === 'private' && !message.from?.is_bot &&
+        MESSAGE_CONTENT_FIELDS.some(field => Boolean(message[field]));
+}
+
 export function validateSecretToken(token) {
     return token.length > 15 && /[A-Z]/.test(token) && /[a-z]/.test(token) && /[0-9]/.test(token);
 }
@@ -37,7 +51,7 @@ export async function handleInstall(request, ownerUid, botToken, prefix, secretT
     try {
         const response = await postToTelegramApi(botToken, 'setWebhook', {
             url: webhookUrl,
-            allowed_updates: ['message'],
+            allowed_updates: ['message', 'callback_query'],
             secret_token: secretToken
         });
 
@@ -75,19 +89,45 @@ export async function handleUninstall(botToken, secretToken) {
 }
 
 export async function handleWebhook(request, ownerUid, botToken, secretToken) {
-    if (secretToken !== request.headers.get('X-Telegram-Bot-Api-Secret-Token')) {
+    if (!validateSecretToken(secretToken) || secretToken !== request.headers.get('X-Telegram-Bot-Api-Secret-Token')) {
         return new Response('Unauthorized', {status: 401});
     }
 
     const update = await request.json();
+    const api = async (method, body) => {
+        const response = await postToTelegramApi(botToken, method, body);
+        const result = await response.json();
+        if (!response.ok || !result.ok) {
+            // Telegram returns this when an edit is retried after successful delivery.
+            if (method === 'editMessageText' && result.error_code === 400 &&
+                result.description?.includes('message is not modified')) return true;
+            throw new Error(`Telegram ${method} failed (${result.error_code || response.status})`);
+        }
+        return result.result;
+    };
+    const verification = createVerification({botToken, ownerUid, secretToken, api});
+    if (update.callback_query) {
+        try {
+            if (update.callback_query.data?.startsWith('c1:')) await verification.callback(update.callback_query);
+            else await api('answerCallbackQuery', {callback_query_id: update.callback_query.id});
+            return new Response('OK');
+        } catch (error) {
+            console.error('Verification API failure:', error.message);
+            return new Response('Internal Server Error', {status: 500});
+        }
+    }
     if (!update.message) {
         return new Response('OK');
     }
 
     const message = update.message;
+    if (!isUserMessage(message)) {
+        return new Response('OK');
+    }
     const reply = message.reply_to_message;
     try {
         if (reply && message.chat.id.toString() === ownerUid) {
+            if (String(reply.from?.id) !== botToken.split(':')[0]) return new Response('OK');
             const rm = reply.reply_markup;
             if (rm && rm.inline_keyboard && rm.inline_keyboard.length > 0) {
                 let senderUid = rm.inline_keyboard[0][0].callback_data;
@@ -95,7 +135,8 @@ export async function handleWebhook(request, ownerUid, botToken, secretToken) {
                     senderUid = rm.inline_keyboard[0][0].url.split('tg://user?id=')[1];
                 }
 
-                await postToTelegramApi(botToken, 'copyMessage', {
+                if (!/^\d+$/.test(senderUid || '')) return new Response('OK');
+                await api('copyMessage', {
                     chat_id: parseInt(senderUid),
                     from_chat_id: message.chat.id,
                     message_id: message.message_id
@@ -105,7 +146,16 @@ export async function handleWebhook(request, ownerUid, botToken, secretToken) {
             return new Response('OK');
         }
 
-        if ("/start" === message.text) {
+        if (message.chat.id.toString() === ownerUid) {
+            return new Response('OK');
+        }
+
+        if (!await verification.verified(message.chat.id)) {
+            await verification.challenge(message.chat.id);
+            return new Response('OK');
+        }
+        if (/^\/start(?:@\w+)?(?:\s|$)/.test(message.text || '')) {
+            await api('sendMessage', {chat_id: message.chat.id, text: '已通过验证，可以直接发送消息。'});
             return new Response('OK');
         }
 

@@ -11,7 +11,8 @@ Users can send messages to you through your bot, and you can reply directly to t
 ## ✨ Features
 
 - 🔄 **Two-Way Communication** - Easily receive and reply to messages from users
-- 💾 **No Database Required** - Completely stateless design, zero storage costs
+- 💾 **No Database Required** - No application database; verification receipts are stored in Telegram pinned messages
+- 🛡️ **Basic Anti-Spam Verification** - Messages are forwarded only after users solve a random emoji-button challenge
 - 🌐 **No Personal Domain Required** - Use the free domain provided by Cloudflare Worker
 - 🚀 **Lightweight Deployment** - Complete setup within minutes
 - 💰 **Zero Running Cost** - Operates within Cloudflare's free plan limits
@@ -115,7 +116,7 @@ If you prefer not to use GitHub or command-line tools, you can create the Worker
 1. Log in to the [Cloudflare Dashboard](https://dash.cloudflare.com/)
 2. Navigate to the **Workers & Pages** section
 3. Click **Create Worker**
-4. Delete the default code and paste the code from this project's `src/worker.js` and `src/core.js`
+4. Paste the code from `src/worker.js` into the default entrypoint file. Create `core.js` and `verification.js` in the same directory and paste the code from `src/core.js` and `src/verification.js` into them, preserving the relative imports
 5. Click **Save and Deploy**
 6. Add environment variables in the Worker settings:
    - `PREFIX` (e.g., `public`)
@@ -204,9 +205,33 @@ https://open-wegram-bot.username.workers.dev/public/install/123456789/000000000:
 
 ## 📱 How to Use
 
+### Verification Without an Application Database
+
+On the first message or `/start`, users must click the emoji requested by the bot.
+After a correct answer, the bot pins an HMAC-signed receipt in that user's private chat, valid for approximately 30 days.
+Subsequent messages use Telegram `getChat` to check the pinned receipt's signature, user, bot, recipient, and expiry.
+The application uses no D1, KV, Redis, in-memory verification cache, or external database; Telegram stores the verification state.
+All deployment entrypoints share `src/core.js`. Verification is enabled by default and requires no new environment variables.
+
+**After upgrading, register the webhook again** using the original installation URL to subscribe to `callback_query` updates.
+Manual deployments must also include `src/verification.js`. Existing users need to verify once after upgrading.
+Messages sent before verification are discarded, without forwarding or storage; users must resend them after verification.
+No group invitation is required; receiving and replying still take place in the original private chats.
+
+Limitations:
+
+- This is a basic obstacle for simple bulk-advertising scripts. Scripts that read the prompt or try every button can pass it; it does not replace Turnstile/reCAPTCHA.
+- There is no persistent blacklist, attempt limit, strict rate limit, or cross-request deduplication. Verified accounts can still send spam.
+- Unpinning, deleting, or auto-deleting the receipt, or pinning a newer message, requires verification again. Other pinned messages are not removed.
+- Changing the bot token, recipient, or `SECRET_TOKEN` invalidates existing receipts. Register the webhook again and reverify.
+- Each user message adds one `getChat` request. Verification API failures do not allow unverified messages through; the webhook returns 500 for a retry.
+- Regular forwarding retains the original webhook retry behavior, so duplicate messages can occur in exceptional cases.
+
+Run `npm test` for development checks. Tests mock the Telegram API; before going live, use a real bot to check private-chat pinning, verification after a restart, unpinning, and replies.
+
 ### Receiving Messages 📩
 
-Once set up, any messages sent to your Bot will be forwarded to your Telegram account, with sender information displayed below the message.
+Once set up, messages resent after successful verification will be forwarded to your Telegram account, with sender information displayed below the message.
 
 ### Replying to Messages 📤
 
